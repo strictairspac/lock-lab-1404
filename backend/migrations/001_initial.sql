@@ -3,3 +3,13 @@
 -- Critical locking query (worker only):
 -- SELECT remaining FROM trial_balances WHERE trial_id = :id FOR UPDATE;
 -- SET LOCAL lock_timeout = '250ms';
+--
+-- 冷藏间换柜（停写/封存、跨间移位）相关表：
+--   rooms(location 唯一)
+--   freeze_orders(room_id, code 唯一, status: freezing/sealed/released)
+--   relocations(code 唯一, source_room_id, target_room_id, status: moving/posted)
+-- 房间“当前生效封存”不设指针列（避免与封存单循环外键），由该间最近一张
+-- freezing/sealed 的 freeze_orders 派生。
+-- 跨间受理按 room id 排序加行锁，两间都 normal 才受理，否则整笔回滚：
+--   SELECT id FROM rooms WHERE id = ANY(:ids) ORDER BY id FOR UPDATE;
+-- 停写门禁口径：房间存在 freezing/sealed 的生效封存单时，拒绝登记/改量/进出移位/移交。

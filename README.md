@@ -7,6 +7,7 @@
 团队原先通过纸质交接单、SQL 截图和 Excel 交接。三处痛点：样本版本难统一、并发移交容易重复、超时后无法确认回执是否回滚。上游为样本接收记录，本站承接样本登记、移交申请、并发复核和证据导出，下游为理化检测室与复核员。
 
 - 样本台账：批次、可用份数、保管位置，可录入。
+- 封存与移位：冷藏间换柜前在样本页发起停写/封存与解封；跨间移位两间都受理才整笔落账。
 - 流转申请：关联样本、指定数量和接收实验室。
 - 并发执行：Redis 队列、独立 Python worker、可设锁等待上限。
 - 冲突证据：Backend PID、SQLSTATE、回执回滚、数量守恒与 JSON 导出。
@@ -40,11 +41,27 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 单 worker 顺序运行任务，无生产重试/崩溃恢复调度；worker中断时 running 任务需要人工重建，不能用作生产样本库存扣减。
 
+## 冷藏间换柜：停写/封存与跨间移位
+
+新增 `rooms`、`freeze_orders`、`relocations` 三张表（实体见 `src/models/entities.py`），前端「封存与移位」页（导航 02）。
+
+**封存单状态机** `freezing 等待 → sealed 已封 → released 已解封`。房间派生状态 `normal / freezing / sealed`，其“当前生效封存”不设指针列（避免与封存单循环外键），由该间最近一张 `freezing/sealed` 的 `freeze_orders` 派生。
+
+- 停写发起即落库为 `freezing`，该间立即拒绝新样本登记、改量、进出移位与移交申请（统一返回 409）；其他房间照常，所有历史单据（样本/移交/封存/移位）始终可查。
+- 已受理的在途移位（`relocations.status=moving`）办完后，`reconcile_room` 才把等待单转为 `sealed`；无在途则发起即已封。
+- 跨间移位在**单事务内对源、目标两间按 id 排序 `SELECT … FOR UPDATE` 加行锁**，两间都 `normal` 才受理，否则整笔回滚——不会只扣一间。
+- 落账用**数据库原子增减** `UPDATE samples SET quantity = quantity ± n` 并持行锁；目标接收批次以 `(location,title)` 唯一约束 + 保存点冲突重试保证只建一行，杜绝并发读-改-写丢失更新与重复建批次。
+- 等待状态持久化在库中：服务重启时 `lifespan` 调 `reconcile_all`，先续办全部在途移位（`resume_all_moving`），再把满足条件的等待单转为 `sealed`——恢复的是原停写，不丢单。
+- 解封按封存单 epoch 幂等：同一单重放返回 `idempotent=true` 不重复生效；若该间此后又有新封存，旧单解封返回 409，**不能放开后来封住的库**；`freezing` 未到已封不允许解封。
+- 受控演练开关：移位表单/接口的 `hold=true` 受理后保持在途，用于复现“移位在途时停写、等待中重启、再重发旧解封”。
+
+门禁口径（样本登记/改量、移交申请、跨间移位的源与目标间）：房间存在 `freezing/sealed` 生效封存单即拒。跨间恢复（`resume` 与启动自动续办）不受等待停写阻止——已受理写入必须办完才能封口。
+
 ## 工程说明
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页+登录，反向代理 /api/|
+|frontend|原生HTML/CSS/JS + Nginx|5业务页+登录，反向代理 /api/|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、持久化|
 |worker|Python3.11/psycopg|真实双连接锁竞争|
 |db|PostgreSQL16|业务数据、隔离镜像账本|

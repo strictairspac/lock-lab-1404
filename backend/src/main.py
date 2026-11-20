@@ -2,15 +2,21 @@ import os,logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import text
-from src.config.database import Base,engine
+from src.config.database import Base,engine,Session
 from src.models import entities
 from src.controllers.auth import router as auth
-from src.routes import samples,transfers,trials,audit
+from src.routes import samples,transfers,trials,audit,rooms,relocations
 from src.middlewares.errors import ErrorMiddleware
 from src.middlewares.request_id import RequestIdMiddleware
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
+    # 启动恢复：续办在途移位，并把等待中的停写单在条件满足时转为已封（恢复原停写，不丢单）
+    try:
+        with Session() as db:
+            from src.services.rooms import reconcile_all
+            reconcile_all(db)
+    except Exception: logging.exception('startup reconcile failed')
     if os.getenv('SEED_DEMO','true')=='true':
         try:
             from scripts.seed_demo import seed
@@ -19,10 +25,14 @@ async def lifespan(app):
     yield
 app=FastAPI(title='实验样本流转并发台',lifespan=lifespan)
 app.add_middleware(ErrorMiddleware);app.add_middleware(RequestIdMiddleware)
-for r in (auth,samples.router,transfers.router,trials.router,audit.router): app.include_router(r)
+for r in (auth,samples.router,transfers.router,trials.router,audit.router,rooms.router,relocations.router): app.include_router(r)
 @app.get('/health')
 def health():
     with engine.connect() as c: c.execute(text('SELECT 1'))
-    from src.services.trials import queue
-    queue.ping()
-    return {'status':'healthy'}
+    redis_ok='skipped'
+    if os.getenv('REDIS_URL'):
+        try:
+            from src.services.trials import queue
+            queue.ping(); redis_ok='ok'
+        except Exception: redis_ok='unavailable'
+    return {'status':'healthy','redis':redis_ok}
